@@ -3,7 +3,7 @@
 #[cfg(feature = "axum-extra-typed-routing")]
 pub mod typed;
 
-use std::{convert::Infallible, mem};
+use std::{convert::Infallible, future::Future, mem, pin::Pin, sync::Arc};
 
 use crate::{
     generate::GenContext,
@@ -11,7 +11,10 @@ use crate::{
     Error,
 };
 use axum::routing::{MethodFilter, Route};
-use axum::{body::Body, response::IntoResponse};
+use axum::{
+    body::Body,
+    response::{IntoResponse, Response as AxumResponse},
+};
 use axum::{
     handler::Handler,
     routing::{self, MethodRouter},
@@ -26,6 +29,44 @@ use crate::{
     operation::{OperationHandler, OperationInput, OperationOutput},
     transform::TransformOperation,
 };
+
+type BoxedResponseFuture = Pin<Box<dyn Future<Output = AxumResponse> + Send>>;
+
+/// A [`Handler`] behind a trait object, so that axum's service stack is
+/// instantiated once per state type rather than once per handler.
+struct ErasedHandler<S>(Arc<dyn Fn(Request<Body>, S) -> BoxedResponseFuture + Send + Sync>);
+
+impl<S> Clone for ErasedHandler<S> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S> ErasedHandler<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    fn new<H, T>(handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        Self(Arc::new(move |req, state| {
+            Box::pin(handler.clone().call(req, state))
+        }))
+    }
+}
+
+impl<S> Handler<(), S> for ErasedHandler<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    type Future = BoxedResponseFuture;
+
+    fn call(self, req: Request<Body>, state: S) -> Self::Future {
+        (self.0)(req, state)
+    }
+}
 
 /// A wrapper over [`axum::routing::MethodRouter`] that adds
 /// API documentation-specific features.
@@ -163,7 +204,7 @@ macro_rules! method_router_chain_method {
                 self.operations.insert(stringify!($name), operation);
             }
 
-            self.router = self.router.$name(handler);
+            self.router = self.router.$name(ErasedHandler::new(handler));
             self
         }
     };
@@ -201,7 +242,7 @@ macro_rules! method_router_top_level {
             T: 'static,
             F: FnOnce(TransformOperation<'_>) -> TransformOperation<'_>,
         {
-            let mut router = ApiMethodRouter::from(routing::$name(handler));
+            let mut router = ApiMethodRouter::from(routing::$name(ErasedHandler::new(handler)));
             let mut operation = Operation::default();
             in_context(|ctx| {
                 I::operation_input(ctx, &mut operation);
